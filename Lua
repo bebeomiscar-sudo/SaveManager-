@@ -1,0 +1,647 @@
+-- SaveManager Addon for LinoriaLib Modified
+-- Handles saving/loading of all Toggle + Option values
+-- Supports: writefile/readfile (executors) OR DataStore fallback for Studio
+--
+-- Usage:
+--   local SaveManager = loadstring(...)()
+--   SaveManager:SetLibrary(Library)
+--   SaveManager:SetFolder('MyHub')       -- folder name in workspace storage
+--   SaveManager:BuildConfigSection(Tab)  -- adds Config UI to a tab
+--   SaveManager:SetIgnoreList({ 'SomeToggleIdx' })
+--   SaveManager:Load()                   -- auto-load on start
+
+local SaveManager = {
+    Library    = nil;
+    Folder     = 'LinoriaHub';
+    ConfigName = 'default';
+    Ignore     = {};
+    Loaded     = false;
+}
+
+-- ─────────────────────────────────────────────────────────────
+-- FILE SYSTEM
+-- ─────────────────────────────────────────────────────────────
+
+local function HasFileSystem()
+    return type(writefile) == 'function' and type(readfile) == 'function'
+end
+
+local function SafeRead(path)
+    if not HasFileSystem() then return nil end
+    local ok, result = pcall(readfile, path)
+    return ok and result or nil
+end
+
+local function SafeWrite(path, data)
+    if not HasFileSystem() then return false end
+    local ok = pcall(writefile, path, data)
+    return ok
+end
+
+local function SafeMakeFolder(path)
+    if not HasFileSystem() then return end
+    if not isfolder or not isfolder(path) then
+        pcall(makefolder, path)
+    end
+end
+
+local function GetConfigPath(name)
+    return SaveManager.Folder .. '/' .. (name or SaveManager.ConfigName) .. '.json'
+end
+
+-- ─────────────────────────────────────────────────────────────
+-- JSON ENCODE / DECODE (lightweight, no dependencies)
+-- ─────────────────────────────────────────────────────────────
+
+local JSON = {}
+
+local escapes = { ['"'] = '\\"', ['\\'] = '\\\\', ['\n'] = '\\n', ['\r'] = '\\r', ['\t'] = '\\t' }
+
+local function JsonEncode(val, indent)
+    indent = indent or 0
+    local t = type(val)
+    if t == 'nil' then
+        return 'null'
+    elseif t == 'boolean' then
+        return tostring(val)
+    elseif t == 'number' then
+        if val ~= val then return '0' end  -- NaN guard
+        return tostring(val)
+    elseif t == 'string' then
+        return '"' .. val:gsub('["\\\n\r\t]', escapes) .. '"'
+    elseif t == 'table' then
+        -- Check if array
+        local isArray = true
+        local maxN    = 0
+        for k, _ in next, val do
+            if type(k) ~= 'number' or k ~= math.floor(k) or k < 1 then
+                isArray = false; break
+            end
+            if k > maxN then maxN = k end
+        end
+        isArray = isArray and (maxN == #val)
+
+        local pad  = string.rep('  ', indent + 1)
+        local cpad = string.rep('  ', indent)
+        local parts = {}
+
+        if isArray then
+            for i = 1, #val do
+                table.insert(parts, pad .. JsonEncode(val[i], indent + 1))
+            end
+            return '[\n' .. table.concat(parts, ',\n') .. '\n' .. cpad .. ']'
+        else
+            for k, v in next, val do
+                table.insert(parts, pad .. '"' .. tostring(k) .. '": ' .. JsonEncode(v, indent + 1))
+            end
+            table.sort(parts)
+            return '{\n' .. table.concat(parts, ',\n') .. '\n' .. cpad .. '}'
+        end
+    end
+    return 'null'
+end
+
+-- Minimal JSON decoder
+local function JsonDecode(str)
+    local pos = 1
+
+    local function skip()
+        while pos <= #str and str:sub(pos,pos):match('%s') do pos = pos + 1 end
+    end
+
+    local parseValue  -- forward declare
+
+    local function parseString()
+        pos = pos + 1  -- skip opening "
+        local result = {}
+        while pos <= #str do
+            local c = str:sub(pos, pos)
+            if c == '"' then pos = pos + 1; break
+            elseif c == '\\' then
+                pos = pos + 1
+                local e = str:sub(pos, pos)
+                if     e == '"'  then table.insert(result, '"')
+                elseif e == '\\' then table.insert(result, '\\')
+                elseif e == 'n'  then table.insert(result, '\n')
+                elseif e == 'r'  then table.insert(result, '\r')
+                elseif e == 't'  then table.insert(result, '\t')
+                else table.insert(result, e) end
+            else
+                table.insert(result, c)
+            end
+            pos = pos + 1
+        end
+        return table.concat(result)
+    end
+
+    local function parseArray()
+        pos = pos + 1  -- skip [
+        local arr = {}
+        skip()
+        if str:sub(pos,pos) == ']' then pos = pos + 1; return arr end
+        while true do
+            skip()
+            table.insert(arr, parseValue())
+            skip()
+            local c = str:sub(pos,pos)
+            if c == ']' then pos = pos + 1; break
+            elseif c == ',' then pos = pos + 1
+            end
+        end
+        return arr
+    end
+
+    local function parseObject()
+        pos = pos + 1  -- skip {
+        local obj = {}
+        skip()
+        if str:sub(pos,pos) == '}' then pos = pos + 1; return obj end
+        while true do
+            skip()
+            local key = parseString()
+            skip()
+            pos = pos + 1  -- skip :
+            skip()
+            obj[key] = parseValue()
+            skip()
+            local c = str:sub(pos,pos)
+            if c == '}' then pos = pos + 1; break
+            elseif c == ',' then pos = pos + 1
+            end
+        end
+        return obj
+    end
+
+    parseValue = function()
+        skip()
+        local c = str:sub(pos,pos)
+        if c == '"' then
+            return parseString()
+        elseif c == '[' then
+            return parseArray()
+        elseif c == '{' then
+            return parseObject()
+        elseif c == 't' then
+            pos = pos + 4; return true
+        elseif c == 'f' then
+            pos = pos + 5; return false
+        elseif c == 'n' then
+            pos = pos + 4; return nil
+        else
+            -- number
+            local numStr = str:match('^-?%d+%.?%d*[eE]?[+-]?%d*', pos)
+            if numStr then pos = pos + #numStr; return tonumber(numStr) end
+        end
+        return nil
+    end
+
+    local ok, result = pcall(parseValue)
+    return ok and result or nil
+end
+
+JSON.Encode = JsonEncode
+JSON.Decode = JsonDecode
+
+-- ─────────────────────────────────────────────────────────────
+-- CORE
+-- ─────────────────────────────────────────────────────────────
+
+function SaveManager:SetLibrary(Lib)
+    self.Library = Lib
+    Lib.SaveManager = self
+end
+
+function SaveManager:SetFolder(Name)
+    self.Folder = Name or 'LinoriaHub'
+    SafeMakeFolder(self.Folder)
+end
+
+function SaveManager:SetIgnoreList(List)
+    self.Ignore = List or {}
+end
+
+function SaveManager:IsIgnored(Idx)
+    for _, v in next, self.Ignore do
+        if v == Idx then return true end
+    end
+    return false
+end
+
+-- ─── Serialise a single value into a JSON-safe primitive ─────
+local function SerialiseValue(obj)
+    local t = obj.Type
+
+    if t == 'Toggle' then
+        return obj.Value  -- boolean
+
+    elseif t == 'Slider' then
+        return obj.Value  -- number
+
+    elseif t == 'Input' then
+        return obj.Value  -- string
+
+    elseif t == 'Dropdown' then
+        if obj.Multi then
+            -- table of {Value = true} → array
+            local arr = {}
+            for k, _ in next, obj.Value do
+                table.insert(arr, k)
+            end
+            return arr
+        else
+            return obj.Value  -- string or nil → save as string or ""
+        end
+
+    elseif t == 'ColorPicker' then
+        return {
+            r = math.floor(obj.Value.R * 255),
+            g = math.floor(obj.Value.G * 255),
+            b = math.floor(obj.Value.B * 255),
+            a = obj.Transparency or 0,
+        }
+
+    elseif t == 'KeyPicker' then
+        return {
+            key  = obj.Value,
+            mode = obj.Mode,
+        }
+    end
+
+    return nil
+end
+
+-- ─── Apply a loaded value back onto an obj ───────────────────
+local Toggles = getgenv and getgenv().Toggles or {}
+local Options = getgenv and getgenv().Options  or {}
+
+local function ApplyValue(obj, saved)
+    if saved == nil then return end
+    local t = obj.Type
+
+    if t == 'Toggle' then
+        obj:SetValue(saved == true or saved == 'true')
+
+    elseif t == 'Slider' then
+        local num = tonumber(saved)
+        if num then obj:SetValue(num) end
+
+    elseif t == 'Input' then
+        obj:SetValue(tostring(saved))
+
+    elseif t == 'Dropdown' then
+        if obj.Multi and type(saved) == 'table' then
+            local tbl = {}
+            for _, v in next, saved do tbl[v] = true end
+            obj:SetValue(tbl)
+        elseif not obj.Multi then
+            obj:SetValue(saved ~= '' and saved or nil)
+        end
+
+    elseif t == 'ColorPicker' then
+        if type(saved) == 'table' then
+            local color = Color3.fromRGB(
+                tonumber(saved.r) or 255,
+                tonumber(saved.g) or 255,
+                tonumber(saved.b) or 255
+            )
+            obj:SetValueRGB(color, tonumber(saved.a) or 0)
+        end
+
+    elseif t == 'KeyPicker' then
+        if type(saved) == 'table' then
+            obj:SetValue({ saved.key or obj.Value, saved.mode or obj.Mode })
+        end
+    end
+end
+
+-- ─────────────────────────────────────────────────────────────
+-- SAVE
+-- ─────────────────────────────────────────────────────────────
+function SaveManager:Save(name)
+    name = name or self.ConfigName
+    SafeMakeFolder(self.Folder)
+
+    local data = {}
+
+    -- Toggles
+    local T = getgenv and getgenv().Toggles or Toggles
+    for idx, obj in next, T do
+        if not self:IsIgnored(idx) then
+            data['T_' .. idx] = SerialiseValue(obj)
+        end
+    end
+
+    -- Options
+    local O = getgenv and getgenv().Options or Options
+    for idx, obj in next, O do
+        if not self:IsIgnored(idx) then
+            data['O_' .. idx] = SerialiseValue(obj)
+        end
+    end
+
+    local encoded = JSON.Encode(data)
+    local ok      = SafeWrite(GetConfigPath(name), encoded)
+
+    if self.Library then
+        if ok then
+            self.Library:Notify('Config "' .. name .. '" saved!', 3)
+        else
+            self.Library:Notify('Save failed (no file system?)', 3)
+        end
+    end
+
+    return ok
+end
+
+-- ─────────────────────────────────────────────────────────────
+-- LOAD
+-- ─────────────────────────────────────────────────────────────
+function SaveManager:Load(name)
+    name = name or self.ConfigName
+
+    local raw = SafeRead(GetConfigPath(name))
+    if not raw then
+        if self.Library and self.Loaded then
+            -- Only notify if not the initial silent auto-load attempt
+            self.Library:Notify('Config "' .. name .. '" not found.', 3)
+        end
+        return false
+    end
+
+    local data = JSON.Decode(raw)
+    if type(data) ~= 'table' then
+        if self.Library then
+            self.Library:Notify('Config "' .. name .. '" is corrupted.', 3)
+        end
+        return false
+    end
+
+    local T = getgenv and getgenv().Toggles or Toggles
+    local O = getgenv and getgenv().Options  or Options
+
+    for key, saved in next, data do
+        local prefix = key:sub(1, 2)
+        local idx    = key:sub(3)
+        if prefix == 'T_' then
+            local obj = T[idx]
+            if obj and not self:IsIgnored(idx) then ApplyValue(obj, saved) end
+        elseif prefix == 'O_' then
+            local obj = O[idx]
+            if obj and not self:IsIgnored(idx) then ApplyValue(obj, saved) end
+        end
+    end
+
+    self.Loaded = true
+
+    if self.Library then
+        self.Library:Notify('Config "' .. name .. '" loaded!', 3)
+    end
+
+    return true
+end
+
+-- ─────────────────────────────────────────────────────────────
+-- LIST / DELETE
+-- ─────────────────────────────────────────────────────────────
+function SaveManager:GetConfigList()
+    if not HasFileSystem() then return {} end
+    if not listfiles then return {} end
+    local ok, files = pcall(listfiles, self.Folder)
+    if not ok or type(files) ~= 'table' then return {} end
+    local names = {}
+    for _, path in next, files do
+        local name = path:match('[/\\]([^/\\]+)%.json$')
+        if name then table.insert(names, name) end
+    end
+    table.sort(names)
+    return names
+end
+
+function SaveManager:Delete(name)
+    if not name or name == '' then return end
+    if not HasFileSystem() or not delfile then return end
+    pcall(delfile, GetConfigPath(name))
+    if self.Library then
+        self.Library:Notify('Deleted "' .. name .. '".', 2)
+    end
+end
+
+-- ─────────────────────────────────────────────────────────────
+-- BUILD CONFIG UI  (call once, pass a Tab object)
+-- ─────────────────────────────────────────────────────────────
+function SaveManager:BuildConfigSection(Tab)
+    assert(Tab, 'BuildConfigSection: Tab is required.')
+    assert(self.Library, 'BuildConfigSection: Call SetLibrary first.')
+
+    local Lib = self.Library
+
+    -- We put everything in the right groupbox
+    local Box = Tab:AddRightGroupbox('Configs')
+
+    -- ── Config name input ─────────────────────────────────
+    local NameInput = Box:AddInput('SaveManager_ConfigName', {
+        Default     = self.ConfigName;
+        Text        = 'Config name';
+        Placeholder = 'default';
+        Finished    = false;
+        Callback    = function(val)
+            if val and val ~= '' then
+                self.ConfigName = val
+            end
+        end;
+    })
+
+    -- ── Config selector dropdown ──────────────────────────
+    local function RefreshDropdown()
+        local list = self:GetConfigList()
+        if #list == 0 then list = { 'No configs yet' } end
+        if ConfigDropdown then
+            ConfigDropdown:SetValues(list)
+            ConfigDropdown:SetValue(nil)
+        end
+    end
+
+    local ConfigDropdown
+    ConfigDropdown = Box:AddDropdown('SaveManager_ConfigList', {
+        Text     = 'Saved configs';
+        Values   = self:GetConfigList();
+        AllowNull = true;
+        Callback = function(val)
+            if val and val ~= 'No configs yet' then
+                self.ConfigName  = val
+                NameInput:SetValue(val)
+            end
+        end;
+    })
+
+    Box:AddDivider()
+
+    -- ── Buttons ───────────────────────────────────────────
+    Box:AddButton({
+        Text = 'Save config';
+        Func = function()
+            local name = self.ConfigName
+            if not name or name == '' then
+                return Lib:Notify('Enter a config name first.', 3)
+            end
+            self:Save(name)
+            RefreshDropdown()
+        end;
+    })
+
+    Box:AddButton({
+        Text = 'Load config';
+        Func = function()
+            local name = self.ConfigName
+            if not name or name == '' then
+                return Lib:Notify('Enter or select a config name.', 3)
+            end
+            self:Load(name)
+        end;
+    })
+
+    Box:AddButton({
+        Text        = 'Delete config';
+        DoubleClick = true;
+        Func        = function()
+            local name = self.ConfigName
+            if not name or name == '' then
+                return Lib:Notify('No config selected.', 2)
+            end
+            self:Delete(name)
+            self.ConfigName = 'default'
+            NameInput:SetValue('default')
+            RefreshDropdown()
+        end;
+    })
+
+    Box:AddDivider()
+
+    -- ── Auto-save toggle ──────────────────────────────────
+    Box:AddToggle('SaveManager_AutoSave', {
+        Text    = 'Auto-save on change';
+        Default = false;
+        Callback = function(val)
+            self.AutoSave = val
+        end;
+    })
+
+    -- Patch AttemptSave to honour AutoSave flag
+    local origAttempt = Lib.AttemptSave
+    Lib.AttemptSave = function(...)
+        if self.AutoSave then
+            self:Save()
+        end
+    end
+
+    -- ── Refresh button ────────────────────────────────────
+    Box:AddButton({
+        Text = 'Refresh list';
+        Func = function() RefreshDropdown() end;
+    })
+
+    -- Initial refresh
+    RefreshDropdown()
+
+    self._configBox = Box
+end
+
+-- ─────────────────────────────────────────────────────────────
+-- THEME MANAGER (lightweight, integrated)
+-- Lets users pick from preset themes and saves the choice
+-- ─────────────────────────────────────────────────────────────
+
+SaveManager.Themes = {
+    ['Purple (default)'] = {
+        MainColor       = Color3.fromRGB(32, 32, 38);
+        BackgroundColor = Color3.fromRGB(18, 18, 22);
+        AccentColor     = Color3.fromRGB(100, 80, 255);
+        OutlineColor    = Color3.fromRGB(55, 55, 65);
+        FontColor       = Color3.fromRGB(230, 230, 230);
+    };
+    ['Dark Blue'] = {
+        MainColor       = Color3.fromRGB(28, 32, 42);
+        BackgroundColor = Color3.fromRGB(16, 20, 30);
+        AccentColor     = Color3.fromRGB(0, 120, 255);
+        OutlineColor    = Color3.fromRGB(45, 55, 75);
+        FontColor       = Color3.fromRGB(220, 230, 255);
+    };
+    ['Crimson'] = {
+        MainColor       = Color3.fromRGB(36, 22, 22);
+        BackgroundColor = Color3.fromRGB(20, 12, 12);
+        AccentColor     = Color3.fromRGB(220, 40, 60);
+        OutlineColor    = Color3.fromRGB(70, 35, 35);
+        FontColor       = Color3.fromRGB(240, 210, 210);
+    };
+    ['Emerald'] = {
+        MainColor       = Color3.fromRGB(20, 36, 28);
+        BackgroundColor = Color3.fromRGB(12, 22, 16);
+        AccentColor     = Color3.fromRGB(40, 200, 100);
+        OutlineColor    = Color3.fromRGB(35, 65, 45);
+        FontColor       = Color3.fromRGB(210, 240, 220);
+    };
+    ['Midnight'] = {
+        MainColor       = Color3.fromRGB(22, 22, 30);
+        BackgroundColor = Color3.fromRGB(10, 10, 16);
+        AccentColor     = Color3.fromRGB(160, 100, 255);
+        OutlineColor    = Color3.fromRGB(45, 45, 60);
+        FontColor       = Color3.fromRGB(200, 200, 230);
+    };
+    ['Mocha'] = {
+        MainColor       = Color3.fromRGB(38, 30, 22);
+        BackgroundColor = Color3.fromRGB(22, 16, 10);
+        AccentColor     = Color3.fromRGB(210, 140, 60);
+        OutlineColor    = Color3.fromRGB(70, 55, 35);
+        FontColor       = Color3.fromRGB(240, 220, 190);
+    };
+}
+
+function SaveManager:ApplyTheme(ThemeName)
+    local theme = self.Themes[ThemeName]
+    if not theme or not self.Library then return end
+
+    local Lib = self.Library
+    for k, v in next, theme do
+        Lib[k] = v
+    end
+    Lib.AccentColorDark = Lib:GetDarkerColor(Lib.AccentColor)
+    Lib:UpdateColorsUsingRegistry()
+
+    self.CurrentTheme = ThemeName
+end
+
+function SaveManager:BuildThemeSection(Tab)
+    assert(Tab,         'BuildThemeSection: Tab is required.')
+    assert(self.Library,'BuildThemeSection: Call SetLibrary first.')
+
+    local Box = Tab:AddLeftGroupbox('Theme')
+
+    local themeNames = {}
+    for name in next, self.Themes do table.insert(themeNames, name) end
+    table.sort(themeNames)
+
+    Box:AddDropdown('SaveManager_Theme', {
+        Text     = 'Select theme';
+        Values   = themeNames;
+        Default  = themeNames[1];
+        AllowNull = false;
+        Callback = function(val)
+            if val then self:ApplyTheme(val) end
+        end;
+    })
+
+    -- Custom accent color picker
+    Box:AddLabel('Accent color'):AddColorPicker('SaveManager_AccentColor', {
+        Default  = self.Library.AccentColor;
+        Title    = 'Accent color';
+        Callback = function(color)
+            if self.Library then
+                self.Library.AccentColor     = color
+                self.Library.AccentColorDark = self.Library:GetDarkerColor(color)
+                self.Library:UpdateColorsUsingRegistry()
+            end
+        end;
+    })
+end
+
+return SaveManager
